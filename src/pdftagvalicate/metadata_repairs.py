@@ -11,11 +11,13 @@ _PDFUAID_NS = "http://www.aiim.org/pdfua/ns/id/"
 
 
 def fix_pdf_ua_identifier(pdf: pikepdf.Pdf) -> RepairReport:
-    """Adds pdfuaid:part = 1 to the XMP metadata stream."""
+    """Adds pdfuaid:part = 1 to the XMP metadata stream (idempotent)."""
     name = "PDF/UA identifier (pdfuaid:part)"
     try:
         with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
             meta.register_xml_namespace(_PDFUAID_NS, "pdfuaid")
+            if meta.get("pdfuaid:part") == "1":
+                return RepairReport(name, 0, "pdfuaid:part is already '1'.")
             meta["pdfuaid:part"] = "1"
         return RepairReport(name, 1, "Added pdfuaid:part = 1 to XMP metadata.")
     except Exception as ex:  # noqa: BLE001 - surfaced to the caller as a report
@@ -23,7 +25,7 @@ def fix_pdf_ua_identifier(pdf: pikepdf.Pdf) -> RepairReport:
 
 
 def fix_mark_info(pdf: pikepdf.Pdf) -> RepairReport:
-    """Ensures /MarkInfo /Marked is true."""
+    """Ensures /MarkInfo /Marked is true — only when a struct tree exists."""
     name = "MarkInfo /Marked"
     catalog = pdf.Root
     mark_info = catalog.get(Name.MarkInfo)
@@ -31,6 +33,12 @@ def fix_mark_info(pdf: pikepdf.Pdf) -> RepairReport:
 
     if marked:
         return RepairReport(name, 0, "/MarkInfo /Marked is already true.")
+
+    if catalog.get(Name.StructTreeRoot) is None:
+        return RepairReport(
+            name, 0,
+            "Skipped - no /StructTreeRoot present; setting Marked=true would falsely claim this PDF is tagged."
+        )
 
     if mark_info is None:
         mark_info = Dictionary()

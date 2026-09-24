@@ -10,7 +10,7 @@ via ``same_object``.
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Object
@@ -98,6 +98,191 @@ def replace_kid(parent: Dictionary, old_kid: Dictionary, new_kids: Iterable[Obje
             parent[Name.K] = Array(new_kids)
         return True
     return False
+
+
+def object_key(obj) -> object:
+    """Stable identity key for a pikepdf object.
+
+    Returns ``(obj_number, gen_number)`` for indirect objects and ``id(obj)``
+    for bare direct objects.  Use this (not ``objgen`` alone) whenever you need
+    a hashable key that distinguishes direct objects from one another.
+
+    This consolidates the independent ``_visit_key`` implementations that used
+    to live in *tbody_repair* and *link_nesting_repair* so they can’t silently
+    diverge.
+    """
+    objgen = getattr(obj, "objgen", (0, 0))
+    return objgen if objgen != (0, 0) else id(obj)
+
+
+def walk_struct_tree(
+    node,
+    visitor,
+    visited: set | None = None,
+) -> None:
+    """Depth-first walk of a PDF struct tree.
+
+    Calls ``visitor(node)`` for every *Dictionary* node encountered (including
+    *node* itself).  A cycle guard (via :func:`object_key`) prevents infinite
+    loops on malformed/cyclic struct trees — exactly the input class this tool
+    targets.
+
+    Parameters
+    ----------
+    node:
+        Starting node — may be a :class:`~pikepdf.Dictionary`,
+        :class:`~pikepdf.Array`, or anything else (non-dict values are skipped).
+    visitor:
+        Callable receiving each dictionary node.  Return value is ignored.
+    visited:
+        Mutable set of already-seen :func:`object_key` values; created
+        automatically on the first call.
+    """
+    if visited is None:
+        visited = set()
+    if isinstance(node, Array):
+        for item in node:
+            walk_struct_tree(item, visitor, visited)
+        return
+    if not isinstance(node, Dictionary):
+        return
+    key = object_key(node)
+    if key in visited:
+        return
+    visited.add(key)
+    visitor(node)
+    k = node.get(Name.K)
+    if k is not None:
+        walk_struct_tree(k, visitor, visited)
+
+
+# ---------------------------------------------------------------------------
+# P3 validator helpers
+# ---------------------------------------------------------------------------
+
+# Standard PDF 1.7 structure roles (PDF 1.7 §14.8.4).
+_STANDARD_ROLES: frozenset[str] = frozenset({
+    "Document", "Part", "Art", "Sect", "Div", "BlockQuote", "Caption",
+    "TOC", "TOCI", "Index", "NonStruct", "Private",
+    "H", "H1", "H2", "H3", "H4", "H5", "H6",
+    "P", "L", "LI", "Lbl", "LBody",
+    "Table", "TR", "TH", "TD", "THead", "TBody", "TFoot",
+    "Span", "Quote", "Note", "Reference", "BibEntry", "Code",
+    "Link", "Annot", "Ruby", "Warichu",
+    "Figure", "Formula", "Form",
+})
+
+
+def resolve_role(role: str, struct_root: Dictionary) -> str:
+    """Resolve *role* transitively through ``StructTreeRoot/RoleMap``.
+
+    Returns the terminal standard role name, or *role* itself if it is
+    already standard or if the RoleMap is absent.  A cycle guard prevents
+    infinite loops on malformed role maps.
+
+    Shared by: check 14-001 (role map validity) and 09-007 (first heading).
+    """
+    if role in _STANDARD_ROLES:
+        return role
+
+    role_map = struct_root.get(Name.RoleMap)
+    if role_map is None or not isinstance(role_map, Dictionary):
+        return role
+
+    visited: set[str] = set()
+    current = role
+    while current not in _STANDARD_ROLES:
+        if current in visited:
+            # Cycle detected — return the last seen name.
+            return current
+        visited.add(current)
+        mapped = role_map.get(Name("/" + current))
+        if mapped is None:
+            return current  # not in role map → unresolvable
+        current = str(mapped)[1:]  # strip leading '/'
+    return current
+
+
+def find_page_index(struct_elem: Dictionary, pdf: pikepdf.Pdf) -> Optional[int]:
+    """Return the zero-based page index for the content of *struct_elem*.
+
+    Strategy (mirrors C# ``FindPage()``):
+    1. ``/Pg`` on the element itself.
+    2. ``/Pg`` on the first MCR or OBJR descendant.
+    3. ``None`` if no page reference can be found.
+
+    The C# original duplicates this pattern in 09-004, 14-002, 14-003,
+    14-004.  One shared helper avoids the drift.
+    """
+    # Build a fast page-obj → index map (cached on the pdf object).
+    cache_attr = "_pdftagvalicate_page_index"
+    if not hasattr(pdf, cache_attr):
+        index_map: dict[tuple, int] = {}
+        for i, page in enumerate(pdf.pages):
+            key = getattr(page.obj, "objgen", None)
+            if key and key != (0, 0):
+                index_map[key] = i
+        object.__setattr__(pdf, cache_attr, index_map)  # type: ignore[arg-type]
+    page_index_map: dict[tuple, int] = getattr(pdf, cache_attr)
+
+    def _resolve_pg(pg_obj) -> Optional[int]:
+        if pg_obj is None:
+            return None
+        key = getattr(pg_obj, "objgen", (0, 0))
+        return page_index_map.get(key)
+
+    # 1. Direct /Pg on the element.
+    direct = _resolve_pg(struct_elem.get(Name.Pg))
+    if direct is not None:
+        return direct
+
+    # 2. First MCR/OBJR descendant's /Pg  (BFS, cycle-guarded).
+    queue = list(get_kids(struct_elem))
+    seen: set = set()
+    while queue:
+        kid = queue.pop(0)
+        if not isinstance(kid, Dictionary):
+            continue
+        kid_key = object_key(kid)
+        if kid_key in seen:
+            continue
+        seen.add(kid_key)
+        pg = kid.get(Name.Pg)
+        if pg is not None:
+            idx = _resolve_pg(pg)
+            if idx is not None:
+                return idx
+        queue.extend(get_kids(kid))
+
+    return None
+
+
+def iter_font_resources(pdf: pikepdf.Pdf) -> Iterator[Dictionary]:
+    """Yield every font dictionary reachable from any page's resources.
+
+    Walks ``/Resources/Font`` on each page (falling back to inherited
+    resources via pikepdf's transparent dereferencing).  Deduplicates by
+    indirect-object identity so shared font dicts aren't reported twice.
+
+    Used by: check 31-001 (all fonts embedded).
+    """
+    seen_keys: set = set()
+    for page in pdf.pages:
+        resources = page.obj.get(Name.Resources)
+        if resources is None:
+            continue
+        font_dict = resources.get(Name.Font)
+        if not isinstance(font_dict, Dictionary):
+            continue
+        for key in font_dict.keys():
+            font = font_dict[key]
+            if not isinstance(font, Dictionary):
+                continue
+            fkey = object_key(font)
+            if fkey in seen_keys:
+                continue
+            seen_keys.add(fkey)
+            yield font
 
 
 def append_kid(parent: Dictionary, new_kid: Object) -> None:

@@ -1,8 +1,9 @@
-"""Shared data types for pdftagvalicate repairs."""
+"""Shared data types for pdftagvalicate repairs and validation checks."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from enum import Enum
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,60 @@ class RepairReport:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+class Severity(Enum):
+    """Result severity for a single PDF/UA validation check.
+
+    Mirrors the ``Severity`` enum in ``Seismic.CTS.PdfUaChecker``
+    (CheckTypes.cs).  Ordering: Pass < Info < Warning < Fail < Error.
+    """
+    Pass = "Pass"
+    Info = "Info"
+    Warning = "Warning"
+    Fail = "Fail"
+    Error = "Error"
+
+    def _rank(self) -> int:
+        return ["Pass", "Info", "Warning", "Fail", "Error"].index(self.value)
+
+    def __lt__(self, other: "Severity") -> bool:
+        return self._rank() < other._rank()
+
+    def __le__(self, other: "Severity") -> bool:
+        return self._rank() <= other._rank()
+
+    def __ge__(self, other: "Severity") -> bool:
+        return self._rank() >= other._rank()
+
+    def __gt__(self, other: "Severity") -> bool:
+        return self._rank() > other._rank()
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    """Result of a single read-only PDF/UA validation check."""
+
+    id: str          # Matterhorn clause ID, e.g. "01-005"
+    name: str        # Human-readable name
+    severity: Severity
+    detail: str      # Free-text explanation
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["severity"] = self.severity.value
+        return d
+
+
+@dataclass
+class ValidateOptions:
+    """Which checks to run and output modifiers."""
+
+    strict: bool = False   # treat Warning as Fail for exit-code purposes
+
+    @property
+    def fail_threshold(self) -> Severity:
+        return Severity.Warning if self.strict else Severity.Fail
 
 
 @dataclass
