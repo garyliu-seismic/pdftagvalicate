@@ -1,11 +1,6 @@
 # pdftagvalicate
 
-PDF/UA tag-tree validator and auto-repair tool. Python port of
-`Seismic.CTS.PdfUaRepairer` (originally iText/C#, from
-`content-transformation-service-v2`), rebuilt on
-[pikepdf](https://github.com/pikepdf/pikepdf) (which wraps
-[qpdf](https://github.com/qpdf/qpdf)) so it runs standalone with no .NET
-runtime — e.g. as a CLI tool an LLM agent (Claude Code) can shell out to.
+PDF/UA tag-tree validator and auto-repair tool.
 
 License note: pikepdf is MPL-2.0 and qpdf is Apache-2.0 — both permissive,
 free for closed-source/commercial use, unlike iText's AGPL/commercial dual
