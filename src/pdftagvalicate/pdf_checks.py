@@ -827,3 +827,571 @@ def _resolve_xobject_any(resources, name) -> "tuple[str, Dictionary] | None":
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+# ===========================================================================
+# P4 — Extended PAC checks
+# ===========================================================================
+
+import re as _re
+
+_BCP47_RE = _re.compile(
+    r"^[a-zA-Z]{2,3}"          # primary language subtag
+    r"(-[a-zA-Z]{4})?"         # optional script
+    r"(-[a-zA-Z]{2}|\d{3})?"   # optional region
+    r"(-[a-zA-Z0-9]{5,8}|\d{4})*"  # optional variant(s)
+    r"(-[a-zA-Z]-[a-zA-Z0-9]{2,8})*"  # optional extensions
+    r"(-x(-[a-zA-Z0-9]{1,8})+)?$"     # optional private-use
+)
+
+
+# ---------------------------------------------------------------------------
+# 08-001  Encryption allows assistive technology access
+# ---------------------------------------------------------------------------
+
+def check_08_001(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 08-001: if the document is encrypted, the permissions must
+    allow content copying for accessibility (bit 10 of the /P flags)."""
+    _id   = "08-001"
+    _name = "Encryption allows AT access"
+
+    if not pdf.is_encrypted:
+        return CheckResult(_id, _name, Severity.Pass, "Document is not encrypted.")
+
+    # PDF permission bit 10 (0-indexed from bit 1) = 0x100 in /P field.
+    # The /P value is a signed 32-bit integer; bit 10 (1-indexed) = mask 0x200.
+    try:
+        p_flags = int(pdf.encryption.P)
+    except Exception:  # noqa: BLE001
+        return CheckResult(_id, _name, Severity.Warning,
+                           "Document is encrypted but /P permissions flags could not be read.")
+
+    accessibility_bit = 0x200  # bit 10 (PDF spec Table 22)
+    if not (p_flags & accessibility_bit):
+        return CheckResult(_id, _name, Severity.Fail,
+                           f"Encryption /P = {p_flags:#010x}: content-copying-for-accessibility bit (0x200) is not set.")
+
+    return CheckResult(_id, _name, Severity.Pass,
+                       "Encryption permits content copying for accessibility.")
+
+
+# ---------------------------------------------------------------------------
+# 01-002  All in-use struct tags are standard or mapped in RoleMap
+# ---------------------------------------------------------------------------
+
+def check_01_002(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 01-002: every /S (structure type) used in the struct tree
+    must either be a standard PDF 1.7 role or appear as a key in RoleMap."""
+    _id   = "01-002"
+    _name = "All struct tags standard or role-mapped"
+
+    struct_root = pdf.Root.get(Name.StructTreeRoot)
+    if struct_root is None:
+        return CheckResult(_id, _name, Severity.Info, "No struct tree — check skipped.")
+
+    role_map = struct_root.get(Name.RoleMap)
+    mapped_keys: set[str] = set()
+    if isinstance(role_map, Dictionary):
+        for k in role_map.keys():
+            mapped_keys.add(str(k)[1:])  # strip leading '/'
+
+    unmapped: list[str] = []
+
+    def _visit(node: Dictionary) -> None:
+        raw = node.get(Name.S)
+        if raw is None:
+            return
+        role = str(raw)[1:]
+        if role not in _STANDARD_ROLES and role not in mapped_keys:
+            unmapped.append(role)
+
+    walk_struct_tree(struct_root, _visit)
+
+    if unmapped:
+        unique = sorted(set(unmapped))
+        return CheckResult(_id, _name, Severity.Fail,
+                           f"{len(unmapped)} struct element(s) use non-standard, unmapped roles: {unique}.")
+    return CheckResult(_id, _name, Severity.Pass,
+                       "All struct tags are standard PDF 1.7 roles or mapped in RoleMap.")
+
+
+# ---------------------------------------------------------------------------
+# 06-004  XMP dc:title matches DocInfo /Title
+# ---------------------------------------------------------------------------
+
+def check_06_004(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 06-004: if both XMP dc:title and DocInfo /Title are present
+    they must agree (case-insensitive, trimmed)."""
+    _id   = "06-004"
+    _name = "XMP dc:title matches DocInfo /Title"
+
+    doc_info_title = ""
+    doc_info = pdf.docinfo
+    if doc_info:
+        raw = doc_info.get("/Title")
+        doc_info_title = str(raw).strip() if raw is not None else ""
+
+    xmp_title = ""
+    try:
+        with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+            val = meta.get("dc:title")
+            xmp_title = str(val).strip() if val is not None else ""
+    except Exception:  # noqa: BLE001
+        pass
+
+    if not doc_info_title or not xmp_title:
+        return CheckResult(_id, _name, Severity.Info,
+                           "One or both title fields absent — no conflict to check.")
+
+    if doc_info_title.lower() != xmp_title.lower():
+        return CheckResult(_id, _name, Severity.Warning,
+                           f"DocInfo /Title = {doc_info_title!r} differs from XMP dc:title = {xmp_title!r}.")
+
+    return CheckResult(_id, _name, Severity.Pass,
+                       f"DocInfo /Title and XMP dc:title agree: {doc_info_title!r}.")
+
+
+# ---------------------------------------------------------------------------
+# 11-002  /Lang values are valid BCP-47 tags
+# ---------------------------------------------------------------------------
+
+def check_11_002(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 11-002: every /Lang value in the document (catalog, pages,
+    struct elements) must be a valid BCP-47 language tag."""
+    _id   = "11-002"
+    _name = "/Lang values are valid BCP-47 tags"
+
+    invalid: list[str] = []
+
+    def _check_lang(val, location: str) -> None:
+        s = str(val).strip()
+        if s and not _BCP47_RE.match(s):
+            invalid.append(f"{location}: {s!r}")
+
+    # Document catalog.
+    lang = pdf.Root.get(Name.Lang)
+    if lang is not None:
+        _check_lang(lang, "catalog /Lang")
+
+    # Page /Lang entries.
+    for i, page in enumerate(pdf.pages):
+        pl = page.obj.get(Name.Lang)
+        if pl is not None:
+            _check_lang(pl, f"page {i+1} /Lang")
+
+    # Struct tree element /Lang attributes.
+    struct_root = pdf.Root.get(Name.StructTreeRoot)
+    if struct_root is not None:
+        def _visit(node: Dictionary) -> None:
+            el = node.get(Name.Lang)
+            if el is not None:
+                objgen = getattr(node, "objgen", (0, 0))
+                _check_lang(el, f"struct elem obj {objgen[0]} /Lang")
+        walk_struct_tree(struct_root, _visit)
+
+    if invalid:
+        detail = f"{len(invalid)} invalid BCP-47 tag(s): " + "; ".join(invalid[:5])
+        if len(invalid) > 5:
+            detail += f" … (+{len(invalid) - 5} more)"
+        return CheckResult(_id, _name, Severity.Fail, detail)
+
+    return CheckResult(_id, _name, Severity.Pass, "All /Lang values are valid BCP-47 tags.")
+
+
+# ---------------------------------------------------------------------------
+# 09-008  Heading levels are not skipped
+# ---------------------------------------------------------------------------
+
+def check_09_008(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 09-008 (local): heading levels must not skip more than one
+    step (e.g., H1 → H3 is invalid; H1 → H2 is fine).
+
+    This is not an official Matterhorn ID but is a prominent PAC 3 check.
+    """
+    _id   = "09-008"
+    _name = "Heading levels not skipped"
+
+    struct_root = pdf.Root.get(Name.StructTreeRoot)
+    if struct_root is None:
+        return CheckResult(_id, _name, Severity.Info, "No struct tree — check skipped.")
+
+    headings: list[tuple[int, str]] = []  # (level, resolved_role)
+
+    def _visit(node: Dictionary) -> None:
+        resolved = resolve_role(role_of(node) or "", struct_root)
+        if resolved in _HEADING_ROLES:
+            if resolved == "H":
+                headings.append((0, resolved))  # unlevelled
+            else:
+                headings.append((int(resolved[1]), resolved))
+
+    walk_struct_tree(struct_root, _visit)
+
+    if not headings:
+        return CheckResult(_id, _name, Severity.Info, "No heading elements found.")
+
+    # Only check levelled headings (H1-H6).
+    levelled = [(lvl, r) for lvl, r in headings if lvl > 0]
+    skips: list[str] = []
+    for i in range(1, len(levelled)):
+        prev_lvl, prev_r = levelled[i - 1]
+        curr_lvl, curr_r = levelled[i]
+        if curr_lvl > prev_lvl + 1:
+            skips.append(f"<{prev_r}> → <{curr_r}>")
+
+    if skips:
+        return CheckResult(_id, _name, Severity.Fail,
+                           f"{len(skips)} heading level skip(s): " + "; ".join(skips[:5]))
+
+    return CheckResult(_id, _name, Severity.Pass, "Heading levels are sequential with no skips.")
+
+
+# ---------------------------------------------------------------------------
+# 15-001  List structure: L contains only LI (or Caption); LI contains LBody
+# ---------------------------------------------------------------------------
+
+def check_15_001(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 15-001: every <LI> must be a direct child of <L>; every
+    <Lbl>/<LBody> must be a direct child of <LI>; every <LI> must have
+    at least one <LBody> child."""
+    _id   = "15-001"
+    _name = "List structure valid (L > LI > LBody)"
+
+    struct_root = pdf.Root.get(Name.StructTreeRoot)
+    if struct_root is None:
+        return CheckResult(_id, _name, Severity.Info, "No struct tree — check skipped.")
+
+    violations: list[str] = []
+
+    def _visit(node: Dictionary) -> None:
+        role = resolve_role(role_of(node) or "", struct_root)
+        kids = get_struct_kids(node)
+        kid_roles = [resolve_role(role_of(k) or "", struct_root) for k in kids]
+
+        if role == "L":
+            # Direct children must be LI or Caption.
+            bad = [r for r in kid_roles if r not in ("LI", "Caption")]
+            if bad:
+                og = getattr(node, "objgen", (0, 0))
+                violations.append(f"<L> obj {og[0]} has non-LI children: {bad}")
+
+        elif role == "LI":
+            # Must have at least one LBody.
+            if "LBody" not in kid_roles:
+                og = getattr(node, "objgen", (0, 0))
+                violations.append(f"<LI> obj {og[0]} has no <LBody> child")
+
+        elif role in ("Lbl", "LBody"):
+            # Must be inside an LI.
+            parent_role = resolve_role(role_of(node.get(Name.P) or Dictionary()) or "", struct_root) \
+                if isinstance(node.get(Name.P), Dictionary) else ""
+            if parent_role != "LI":
+                og = getattr(node, "objgen", (0, 0))
+                violations.append(f"<{role}> obj {og[0]} is not a child of <LI> (parent: {parent_role!r})")
+
+    walk_struct_tree(struct_root, _visit)
+
+    if violations:
+        detail = f"{len(violations)} list structure violation(s): " + "; ".join(violations[:5])
+        if len(violations) > 5:
+            detail += f" … (+{len(violations) - 5} more)"
+        return CheckResult(_id, _name, Severity.Fail, detail)
+
+    return CheckResult(_id, _name, Severity.Pass, "All list structures are valid.")
+
+
+# ---------------------------------------------------------------------------
+# 15-002  <L> contains only <LI> or <Caption>
+# ---------------------------------------------------------------------------
+
+def check_15_002(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 15-002: every <L> element must contain only <LI> or
+    <Caption> as direct struct children."""
+    _id   = "15-002"
+    _name = "<L> contains only <LI> or <Caption>"
+
+    struct_root = pdf.Root.get(Name.StructTreeRoot)
+    if struct_root is None:
+        return CheckResult(_id, _name, Severity.Info, "No struct tree — check skipped.")
+
+    violations: list[str] = []
+
+    def _visit(node: Dictionary) -> None:
+        if resolve_role(role_of(node) or "", struct_root) != "L":
+            return
+        bad = [
+            resolve_role(role_of(k) or "", struct_root)
+            for k in get_struct_kids(node)
+            if resolve_role(role_of(k) or "", struct_root) not in ("LI", "Caption")
+        ]
+        if bad:
+            og = getattr(node, "objgen", (0, 0))
+            violations.append(f"<L> obj {og[0]} has invalid children: {bad}")
+
+    walk_struct_tree(struct_root, _visit)
+
+    if violations:
+        detail = f"{len(violations)} <L> element(s) with invalid children: " + "; ".join(violations[:5])
+        if len(violations) > 5:
+            detail += f" … (+{len(violations) - 5} more)"
+        return CheckResult(_id, _name, Severity.Fail, detail)
+
+    return CheckResult(_id, _name, Severity.Pass, "All <L> elements contain only <LI> or <Caption>.")
+
+
+# ---------------------------------------------------------------------------
+# 17-001  Widget annotations nested inside <Form> struct element
+# ---------------------------------------------------------------------------
+
+def check_17_001(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 17-001: every Widget annotation must be referenced from a
+    <Form> struct element via an OBJR — mirrors check_28_001 for form fields."""
+    _id   = "17-001"
+    _name = "Widget annotations nested inside <Form>"
+
+    struct_root = pdf.Root.get(Name.StructTreeRoot)
+
+    # Collect obj-numbers of annotations already referenced from struct tree.
+    tagged_obj_nums: set[int] = set()
+    if struct_root is not None:
+        def _collect(node: Dictionary) -> None:
+            for kid in get_kids(node):
+                if isinstance(kid, Dictionary) and kid.get(Name.Type) == Name.OBJR:
+                    ref = kid.get(Name.Obj)
+                    if ref is not None:
+                        og = getattr(ref, "objgen", (0, 0))
+                        if og != (0, 0):
+                            tagged_obj_nums.add(og[0])
+        walk_struct_tree(struct_root, _collect)
+
+    untagged: list[str] = []
+    for page_idx, page in enumerate(pdf.pages):
+        annots = page.get(Name.Annots)
+        if annots is None:
+            continue
+        for annot in annots:
+            if not isinstance(annot, Dictionary):
+                continue
+            if annot.get(Name.Subtype) != Name.Widget:
+                continue
+            og = getattr(annot, "objgen", (0, 0))
+            if og == (0, 0) or og[0] not in tagged_obj_nums:
+                field_name = str(annot.get(Name.T) or annot.get(Name.TU) or f"obj {og[0]}")
+                untagged.append(f"{field_name} on p.{page_idx + 1}")
+
+    if untagged:
+        detail = f"{len(untagged)} Widget annotation(s) not in a <Form> struct element: " + "; ".join(untagged[:5])
+        if len(untagged) > 5:
+            detail += f" … (+{len(untagged) - 5} more)"
+        return CheckResult(_id, _name, Severity.Fail, detail)
+
+    return CheckResult(_id, _name, Severity.Pass,
+                       "All Widget annotations are referenced from <Form> struct elements.")
+
+
+# ---------------------------------------------------------------------------
+# 17-002  Form fields have a tooltip (/TU)
+# ---------------------------------------------------------------------------
+
+def check_17_002(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 17-002: every interactive form field must have a non-empty
+    /TU (tooltip / alternate field name) entry — screen readers use this as
+    the accessible label."""
+    _id   = "17-002"
+    _name = "Form fields have tooltip (/TU)"
+
+    acroform = pdf.Root.get(Name.AcroForm)
+    if acroform is None:
+        return CheckResult(_id, _name, Severity.Info, "No AcroForm — check skipped.")
+
+    fields_arr = acroform.get(Name.Fields)
+    if fields_arr is None:
+        return CheckResult(_id, _name, Severity.Info, "AcroForm has no /Fields — check skipped.")
+
+    missing: list[str] = []
+    seen: set = set()
+
+    def _walk_fields(arr) -> None:
+        for item in arr:
+            if not isinstance(item, Dictionary):
+                continue
+            key = object_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            # Only terminal fields (with /FT) are interactive; non-terminal
+            # are pure containers.
+            if Name.FT in item:
+                tu = item.get(Name.TU)
+                if tu is None or str(tu).strip() == "":
+                    name = str(item.get(Name.T) or f"obj {getattr(item, 'objgen', (0,0))[0]}")
+                    missing.append(name)
+            kids = item.get(Name.Kids)
+            if isinstance(kids, Array):
+                _walk_fields(kids)
+
+    _walk_fields(fields_arr)
+
+    if missing:
+        detail = f"{len(missing)} field(s) missing /TU tooltip: " + ", ".join(missing[:5])
+        if len(missing) > 5:
+            detail += f" … (+{len(missing) - 5} more)"
+        return CheckResult(_id, _name, Severity.Fail, detail)
+
+    return CheckResult(_id, _name, Severity.Pass, "All form fields have a /TU tooltip.")
+
+
+# ---------------------------------------------------------------------------
+# 22-001  Document outline (bookmarks) present for multi-page documents
+# ---------------------------------------------------------------------------
+
+def check_22_001(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 22-001: documents with more than 21 pages must have a
+    document outline (/Outlines) to support navigation."""
+    _id   = "22-001"
+    _name = "Document outline present (>21 pages)"
+
+    page_count = len(pdf.pages)
+    if page_count <= 21:
+        return CheckResult(_id, _name, Severity.Info,
+                           f"Document has {page_count} page(s) — outline not required.")
+
+    outlines = pdf.Root.get(Name.Outlines)
+    if outlines is None:
+        return CheckResult(_id, _name, Severity.Fail,
+                           f"Document has {page_count} pages but no /Outlines (bookmarks) entry.")
+
+    # Verify the outline has at least one entry.
+    first = outlines.get(Name.First) if isinstance(outlines, Dictionary) else None
+    if first is None:
+        return CheckResult(_id, _name, Severity.Fail,
+                           f"Document has {page_count} pages; /Outlines exists but is empty.")
+
+    return CheckResult(_id, _name, Severity.Pass,
+                       f"Document has {page_count} pages and a non-empty /Outlines tree.")
+
+
+# ---------------------------------------------------------------------------
+# 24-001  Annotations (non-Link, non-Widget) have /Contents
+# ---------------------------------------------------------------------------
+
+# Annotation subtypes that have their own accessibility checks or are exempt.
+_ANNOT_EXEMPT: frozenset[str] = frozenset({
+    "/Link",       # 28-001
+    "/Widget",     # 17-001 / 17-002
+    "/PrinterMark",
+    "/TrapNet",    # prohibited (24-002)
+    "/Movie",      # prohibited (24-002)
+    "/PopUp",      # informational popup — no independent content
+})
+
+
+def check_24_001(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 24-001: every non-Link, non-Widget annotation must have a
+    non-empty /Contents entry (alternative description for AT users)."""
+    _id   = "24-001"
+    _name = "Annotations have /Contents"
+
+    missing: list[str] = []
+    for page_idx, page in enumerate(pdf.pages):
+        annots = page.get(Name.Annots)
+        if annots is None:
+            continue
+        for annot in annots:
+            if not isinstance(annot, Dictionary):
+                continue
+            subtype = str(annot.get(Name.Subtype) or "")
+            if subtype in _ANNOT_EXEMPT:
+                continue
+            contents = annot.get(Name.Contents)
+            if contents is None or str(contents).strip() == "":
+                og = getattr(annot, "objgen", (0, 0))
+                missing.append(f"{subtype} obj {og[0]} on p.{page_idx + 1}")
+
+    if missing:
+        detail = f"{len(missing)} annotation(s) missing /Contents: " + "; ".join(missing[:5])
+        if len(missing) > 5:
+            detail += f" … (+{len(missing) - 5} more)"
+        return CheckResult(_id, _name, Severity.Fail, detail)
+
+    return CheckResult(_id, _name, Severity.Pass,
+                       "All non-Link/non-Widget annotations have /Contents.")
+
+
+# ---------------------------------------------------------------------------
+# 24-002  Prohibited annotation subtypes (TrapNet, Movie)
+# ---------------------------------------------------------------------------
+
+_ANNOT_PROHIBITED: frozenset[str] = frozenset({"/TrapNet", "/Movie"})
+
+
+def check_24_002(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 24-002: TrapNet and Movie annotation subtypes are prohibited
+    by PDF/UA-1."""
+    _id   = "24-002"
+    _name = "No prohibited annotation types (TrapNet, Movie)"
+
+    found: list[str] = []
+    for page_idx, page in enumerate(pdf.pages):
+        annots = page.get(Name.Annots)
+        if annots is None:
+            continue
+        for annot in annots:
+            if not isinstance(annot, Dictionary):
+                continue
+            subtype = str(annot.get(Name.Subtype) or "")
+            if subtype in _ANNOT_PROHIBITED:
+                og = getattr(annot, "objgen", (0, 0))
+                found.append(f"{subtype} obj {og[0]} on p.{page_idx + 1}")
+
+    if found:
+        return CheckResult(_id, _name, Severity.Fail,
+                           f"{len(found)} prohibited annotation(s): " + "; ".join(found))
+
+    return CheckResult(_id, _name, Severity.Pass,
+                       "No TrapNet or Movie annotations found.")
+
+
+# ---------------------------------------------------------------------------
+# 28-002  <Link> struct element's OBJR annotation has /Contents (tooltip)
+# ---------------------------------------------------------------------------
+
+def check_28_002(pdf: pikepdf.Pdf) -> CheckResult:
+    """Matterhorn 28-002: every Link annotation referenced from a <Link> struct
+    element must have a non-empty /Contents entry (accessible link text for AT
+    when the visual label is insufficient)."""
+    _id   = "28-002"
+    _name = "<Link> annotation has /Contents"
+
+    struct_root = pdf.Root.get(Name.StructTreeRoot)
+    if struct_root is None:
+        return CheckResult(_id, _name, Severity.Info, "No struct tree — check skipped.")
+
+    missing: list[str] = []
+
+    def _visit(node: Dictionary) -> None:
+        if resolve_role(role_of(node) or "", struct_root) != "Link":
+            return
+        for kid in get_kids(node):
+            if not isinstance(kid, Dictionary):
+                continue
+            if kid.get(Name.Type) != Name.OBJR:
+                continue
+            annot = kid.get(Name.Obj)
+            if not isinstance(annot, Dictionary):
+                continue
+            contents = annot.get(Name.Contents)
+            if contents is None or str(contents).strip() == "":
+                og = getattr(annot, "objgen", (0, 0))
+                missing.append(f"Link annot obj {og[0]}")
+
+    walk_struct_tree(struct_root, _visit)
+
+    if missing:
+        detail = f"{len(missing)} <Link> annotation(s) missing /Contents: " + "; ".join(missing[:5])
+        if len(missing) > 5:
+            detail += f" … (+{len(missing) - 5} more)"
+        return CheckResult(_id, _name, Severity.Fail, detail)
+
+    return CheckResult(_id, _name, Severity.Pass,
+                       "All <Link> annotations have a /Contents entry.")

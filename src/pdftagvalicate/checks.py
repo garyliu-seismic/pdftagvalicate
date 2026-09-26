@@ -41,6 +41,21 @@ def run_checks(pdf: pikepdf.Pdf, options: ValidateOptions) -> list[CheckResult]:
     _run_one(results, lambda: pdf_checks.check_06_001(pdf))
     _run_one(results, lambda: pdf_checks.check_09_006(pdf))
 
+    # P4 — extended PAC checks
+    _run_one(results, lambda: pdf_checks.check_08_001(pdf))
+    _run_one(results, lambda: pdf_checks.check_01_002(pdf))
+    _run_one(results, lambda: pdf_checks.check_06_004(pdf))
+    _run_one(results, lambda: pdf_checks.check_11_002(pdf))
+    _run_one(results, lambda: pdf_checks.check_09_008(pdf))
+    _run_one(results, lambda: pdf_checks.check_15_001(pdf))
+    _run_one(results, lambda: pdf_checks.check_15_002(pdf))
+    _run_one(results, lambda: pdf_checks.check_17_001(pdf))
+    _run_one(results, lambda: pdf_checks.check_17_002(pdf))
+    _run_one(results, lambda: pdf_checks.check_22_001(pdf))
+    _run_one(results, lambda: pdf_checks.check_24_001(pdf))
+    _run_one(results, lambda: pdf_checks.check_24_002(pdf))
+    _run_one(results, lambda: pdf_checks.check_28_002(pdf))
+
     return results
 
 
