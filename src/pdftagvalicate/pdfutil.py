@@ -168,7 +168,7 @@ _STANDARD_ROLES: frozenset[str] = frozenset({
     "P", "L", "LI", "Lbl", "LBody",
     "Table", "TR", "TH", "TD", "THead", "TBody", "TFoot",
     "Span", "Quote", "Note", "Reference", "BibEntry", "Code",
-    "Link", "Annot", "Ruby", "Warichu",
+    "Link", "Annot", "Ruby", "RB", "RT", "RP", "Warichu", "WT", "WP",
     "Figure", "Formula", "Form",
 })
 

@@ -256,9 +256,12 @@ def check_09_001(pdf: pikepdf.Pdf) -> CheckResult:
         return CheckResult(_id, _name, Severity.Fail,
                            f"{len(doc_kids)} <Document> elements found at root; exactly 1 required.")
     if non_doc:
+        # Mirrors C#: Document present but alongside other elements → Warning not Fail.
         roles = [role_of(k) for k in non_doc]
-        return CheckResult(_id, _name, Severity.Fail,
-                           f"Non-<Document> elements at root alongside <Document>: {roles}.")
+        all_roles = [role_of(k) for k in top_kids]
+        return CheckResult(_id, _name, Severity.Warning,
+                           f"<Document> is present but accompanied by other top-level elements: {roles}. "
+                           f"Roles at root: {all_roles}.")
 
     return CheckResult(_id, _name, Severity.Pass, "Exactly one <Document> element at struct tree root.")
 
@@ -276,7 +279,7 @@ _STANDARD_ROLES: frozenset[str] = frozenset({
     "P", "L", "LI", "Lbl", "LBody",
     "Table", "TR", "TH", "TD", "THead", "TBody", "TFoot",
     "Span", "Quote", "Note", "Reference", "BibEntry", "Code",
-    "Link", "Annot", "Ruby", "Warichu",
+    "Link", "Annot", "Ruby", "RB", "RT", "RP", "Warichu", "WT", "WP",
     "Figure", "Formula", "Form",
 })
 
@@ -495,12 +498,11 @@ def check_31_001(pdf: pikepdf.Pdf) -> CheckResult:
         name_str = str(font.get(Name.BaseFont) or font.get(Name.Name) or "<unknown>")
         descriptor = _get_font_descriptor(font)
         if descriptor is None:
-            # Type 3 fonts have no descriptor — they embed glyph procedures
-            # directly; standard 14 fonts never have a descriptor but are
-            # always available.  Skip rather than false-positive.
+            # Type 3 fonts have no descriptor — they embed glyph procedures directly.
             font_type = str(font.get(Name.Subtype) or "")
-            if font_type not in ("/Type3",):
-                not_embedded.append(f"{name_str} (no FontDescriptor)")
+            if font_type == "/Type3":
+                continue
+            not_embedded.append(f"{name_str} (no FontDescriptor)")
             continue
 
         has_file = (
@@ -645,106 +647,136 @@ def check_06_001(pdf: pikepdf.Pdf) -> CheckResult:
 # 09-006  No untagged real content in page streams
 # ---------------------------------------------------------------------------
 
-# Painting operators that produce visible output.  Any such operator executed
-# outside a marked-content layer (BDC/BMC…EMC stack depth == 0) is a
-# violation.  We use a whitelist so that structural operators (BT/ET, cm, q/Q,
-# etc.) don’t trigger false positives.
-#
-# Text-painting: Tj TJ ' "  (show-string operators, PDF §9.4.3)
-# Path-painting: S s F f f* B B* b b*  (stroke/fill, PDF §8.5.3)
-# Shading/image: sh Do  (pattern shading, XObject invocation)
-_PAINTING_OPS: frozenset[str] = frozenset({
-    "Tj", "TJ", "'", '"',
-    "S", "s", "F", "f", "f*", "B", "B*", "b", "b*",
-    "sh", "Do",
-})
+import enum as _enum
 
-# Marked-content operators.
-_MC_PUSH_OPS: frozenset[str] = frozenset({"BDC", "BMC"})
-_MC_POP_OPS:  frozenset[str] = frozenset({"EMC"})
+class _McLayer(_enum.Enum):
+    """Marked-content layer state, mirroring C# UntaggedContentCheck.McLayer."""
+    Artifact = "Artifact"   # inside /Artifact BDC — explicitly decorative
+    Tagged   = "Tagged"     # inside a valid tagged BDC layer
+    Invalid  = "Invalid"    # inside a BDC in an XObject without /StructParents
 
 
 def check_09_006(pdf: pikepdf.Pdf) -> CheckResult:
     """Matterhorn 09-006: no real-content painting operator may appear outside
     a marked-content layer (BDC/BMC … EMC stack).
 
-    Uses ``pikepdf.parse_content_stream`` to tokenize each page’s stream,
-    tracks the BDC/BMC/EMC nesting depth, and recurses into Form XObjects
-    (``Do`` operator with a ``/Form`` XObject) so that externally-defined
-    content is also checked.  A cycle guard prevents infinite recursion on
-    self-referential XObject graphs.
+    Uses a tri-state layer model (Artifact / Tagged / Invalid) that matches the
+    C# ``UntaggedContentCheck``:
+    - Page streams and Form XObjects **with** ``/StructParents``: any BMC/BDC
+      layer is ``Tagged`` (valid).
+    - Form XObjects **without** ``/StructParents``: only ``/Artifact`` BDC blocks
+      are valid; all other BDC/BMC layers become ``Invalid``.
 
-    Because this is the most expensive check it runs last.  Marking operator
-    violations are reported as ``Fail``; parse errors on a single page are
-    reported as ``Warning`` (partial result) so the other pages are still
-    checked.
+    Recurses into Form XObjects with a cycle guard.  Image XObjects are counted
+    at their ``Do`` call site (not recursed into).  Because this is the most
+    expensive check it runs last.
     """
     _id   = "09-006"
     _name = "No untagged real content in page streams"
 
-    violations: list[str] = []   # (page_label, operator)
-    warnings:   list[str] = []   # parse errors
+    paths:  list[str] = []
+    images: list[str] = []
+    texts:  list[str] = []
+    parse_errors: list[str] = []
 
-    visited_xobjects: set[tuple] = set()   # cycle guard for Form XObjects
+    visited_xobjects: set[tuple] = set()
 
-    def _scan_stream(stream_obj, page_label: str, mc_depth: int) -> int:
-        """Scan one content stream; returns the mc_depth after the stream ends."""
+    def _scan(stream_obj, label: str, mc_stack: list[_McLayer], only_artifacts: bool) -> None:
         try:
             instructions = pikepdf.parse_content_stream(stream_obj)
         except Exception as ex:  # noqa: BLE001
-            warnings.append(f"{page_label}: parse error — {ex}")
-            return mc_depth
+            parse_errors.append(f"{label}: parse error — {ex}")
+            return
 
         resources = _get_resources(stream_obj)
 
         for instr in instructions:
             op = str(instr.operator)
 
-            if op in _MC_PUSH_OPS:
-                mc_depth += 1
-            elif op in _MC_POP_OPS:
-                mc_depth = max(0, mc_depth - 1)
-            elif op in _PAINTING_OPS:
-                if mc_depth == 0:
-                    violations.append(f"{page_label}: untagged '{op}' operator")
-            elif op == "Do":
-                # Recurse into Form XObjects only (Image XObjects are
-                # referenced by their name, not executable).
+            if op in ("BMC", "BDC"):
+                # Determine the new layer state.
+                tag = ""
                 if instr.operands:
-                    xobj_name = instr.operands[0]
-                    xobj = _resolve_xobject(resources, xobj_name)
-                    if xobj is not None:
-                        xobj_key = getattr(xobj, "objgen", (0, 0))
-                        if xobj_key != (0, 0) and xobj_key not in visited_xobjects:
-                            visited_xobjects.add(xobj_key)
-                            mc_depth = _scan_stream(xobj, page_label, mc_depth)
+                    tag = str(instr.operands[0])
+                is_artifact = tag in ("/Artifact", "Artifact")
+                if is_artifact:
+                    layer = _McLayer.Artifact
+                elif not only_artifacts:
+                    layer = _McLayer.Tagged
+                else:
+                    layer = _McLayer.Invalid
+                mc_stack.append(layer)
 
-        return mc_depth
+            elif op == "EMC":
+                if mc_stack:
+                    mc_stack.pop()
+
+            elif op in ("Tj", "TJ", "’", ‘"’):
+                top = mc_stack[-1] if mc_stack else _McLayer.Invalid
+                if top == _McLayer.Invalid or not mc_stack:
+                    texts.append(f"{label}: ‘{op}’")
+
+            elif op in ("S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "sh"):
+                top = mc_stack[-1] if mc_stack else _McLayer.Invalid
+                if top == _McLayer.Invalid or not mc_stack:
+                    paths.append(f"{label}: ‘{op}’")
+
+            elif op == "Do":
+                if not instr.operands:
+                    continue
+                xobj_name = instr.operands[0]
+                resolved = _resolve_xobject_any(resources, xobj_name)
+                top = mc_stack[-1] if mc_stack else _McLayer.Invalid
+                parent_is_safe = bool(mc_stack) and top != _McLayer.Invalid
+                parent_is_artifact = top == _McLayer.Artifact
+                if resolved is None:
+                    # XObject not found — can’t determine type; skip.
+                    continue
+                subtype, xobj = resolved
+                if subtype == "Image":
+                    if not parent_is_artifact and not parent_is_safe:
+                        images.append(f"{label}: ‘Do’ (image)")
+                elif subtype == "Form":
+                    if parent_is_artifact:
+                        continue  # whole form is decorative
+                    xobj_key = getattr(xobj, "objgen", (0, 0))
+                    if xobj_key != (0, 0) and xobj_key in visited_xobjects:
+                        continue
+                    if xobj_key != (0, 0):
+                        visited_xobjects.add(xobj_key)
+                    has_struct_parents = Name.StructParents in xobj
+                    _scan(xobj, label, list(mc_stack), only_artifacts=not has_struct_parents)
 
     for page_idx, page in enumerate(pdf.pages):
         label = f"p.{page_idx + 1}"
         try:
-            _scan_stream(page, label, mc_depth=0)
+            _scan(page, label, mc_stack=[], only_artifacts=False)
         except Exception as ex:  # noqa: BLE001
-            warnings.append(f"{label}: unexpected error — {ex}")
+            parse_errors.append(f"{label}: unexpected error — {ex}")
 
-    if violations:
-        detail = f"{len(violations)} untagged painting operator(s): " + "; ".join(violations[:5])
-        if len(violations) > 5:
-            detail += f" … (+{len(violations) - 5} more)"
-        if warnings:
-            detail += f"  [{len(warnings)} page(s) had parse errors and may be incomplete]"
+    total = len(paths) + len(images) + len(texts)
+    if total == 0 and not parse_errors:
+        return CheckResult(_id, _name, Severity.Pass,
+                           f"All content is tagged across {len(pdf.pages)} page(s).")
+
+    if total > 0:
+        parts = []
+        if paths:
+            parts.append(f"{len(paths)} path object(s) not tagged")
+        if images:
+            parts.append(f"{len(images)} image object(s) not tagged")
+        if texts:
+            parts.append(f"{len(texts)} text object(s) not tagged")
+        detail = f"{total} untagged content object(s): " + "; ".join(parts)
+        if parse_errors:
+            detail += f"  [{len(parse_errors)} stream(s) had parse errors and may be incomplete]"
         return CheckResult(_id, _name, Severity.Fail, detail)
 
-    if warnings:
-        detail = (
-            f"{len(warnings)} page(s) could not be fully parsed; "
-            "untagged content may exist: " + "; ".join(warnings[:3])
-        )
-        return CheckResult(_id, _name, Severity.Warning, detail)
-
-    return CheckResult(_id, _name, Severity.Pass,
-                       "All painting operators appear inside marked-content layers.")
+    detail = (
+        f"{len(parse_errors)} stream(s) could not be fully parsed; "
+        "untagged content may exist: " + "; ".join(parse_errors[:3])
+    )
+    return CheckResult(_id, _name, Severity.Warning, detail)
 
 
 def _get_resources(obj) -> "Dictionary | None":
@@ -773,6 +805,25 @@ def _resolve_xobject(resources, name) -> "Dictionary | None":
             return None
         if str(xobj.get(Name.Subtype) or "") == "/Form":
             return xobj
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _resolve_xobject_any(resources, name) -> "tuple[str, Dictionary] | None":
+    """Resolve an XObject name; return (subtype, dict) or None if not found."""
+    if resources is None:
+        return None
+    try:
+        xobjs = resources.get(Name.XObject)
+        if not isinstance(xobjs, Dictionary):
+            return None
+        name_key = Name("/" + str(name)[1:]) if str(name).startswith("/") else name
+        xobj = xobjs.get(name_key)
+        if not isinstance(xobj, Dictionary):
+            return None
+        subtype = str(xobj.get(Name.Subtype) or "").lstrip("/")
+        return (subtype, xobj)
     except Exception:  # noqa: BLE001
         pass
     return None
