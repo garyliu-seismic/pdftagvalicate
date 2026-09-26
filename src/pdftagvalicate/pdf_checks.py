@@ -836,12 +836,12 @@ def _resolve_xobject_any(resources, name) -> "tuple[str, Dictionary] | None":
 import re as _re
 
 _BCP47_RE = _re.compile(
-    r"^[a-zA-Z]{2,3}"          # primary language subtag
-    r"(-[a-zA-Z]{4})?"         # optional script
-    r"(-[a-zA-Z]{2}|\d{3})?"   # optional region
-    r"(-[a-zA-Z0-9]{5,8}|\d{4})*"  # optional variant(s)
-    r"(-[a-zA-Z]-[a-zA-Z0-9]{2,8})*"  # optional extensions
-    r"(-x(-[a-zA-Z0-9]{1,8})+)?$"     # optional private-use
+    r"^(?:[a-zA-Z]{2,3}|x)"         # primary: 2-3 letter language tag, or 'x' private-use
+    r"(-[a-zA-Z]{4})?"               # optional script subtag
+    r"(-[a-zA-Z]{2}|-\d{3})?"        # optional region subtag (hyphen required)
+    r"(-[a-zA-Z0-9]{5,8}|-\d{4})*"  # optional variant(s)
+    r"(-[a-zA-Z]-[a-zA-Z0-9]{2,8})*"  # optional singleton extensions
+    r"(-x(-[a-zA-Z0-9]{1,8})+)?$"     # optional private-use extension
 )
 
 
@@ -858,8 +858,8 @@ def check_08_001(pdf: pikepdf.Pdf) -> CheckResult:
     if not pdf.is_encrypted:
         return CheckResult(_id, _name, Severity.Pass, "Document is not encrypted.")
 
-    # PDF permission bit 10 (0-indexed from bit 1) = 0x100 in /P field.
-    # The /P value is a signed 32-bit integer; bit 10 (1-indexed) = mask 0x200.
+    # PDF spec Table 22: bit 10 (1-indexed) = 0x200.  This is the
+    # "copy text and graphics for accessibility" permission flag.
     try:
         p_flags = int(pdf.encryption.P)
     except Exception:  # noqa: BLE001
@@ -1068,14 +1068,7 @@ def check_15_001(pdf: pikepdf.Pdf) -> CheckResult:
         kids = get_struct_kids(node)
         kid_roles = [resolve_role(role_of(k) or "", struct_root) for k in kids]
 
-        if role == "L":
-            # Direct children must be LI or Caption.
-            bad = [r for r in kid_roles if r not in ("LI", "Caption")]
-            if bad:
-                og = getattr(node, "objgen", (0, 0))
-                violations.append(f"<L> obj {og[0]} has non-LI children: {bad}")
-
-        elif role == "LI":
+        if role == "LI":
             # Must have at least one LBody.
             if "LBody" not in kid_roles:
                 og = getattr(node, "objgen", (0, 0))
@@ -1150,19 +1143,26 @@ def check_17_001(pdf: pikepdf.Pdf) -> CheckResult:
     _name = "Widget annotations nested inside <Form>"
 
     struct_root = pdf.Root.get(Name.StructTreeRoot)
+    if struct_root is None:
+        return CheckResult(_id, _name, Severity.Info, "No struct tree — check skipped.")
 
-    # Collect obj-numbers of annotations already referenced from struct tree.
+    # Collect obj-numbers of annotations referenced from <Form> struct elements.
+    # We only accept OBJRs that are direct children of a <Form> node; a Widget
+    # buried under <Sect> or <Div> is NOT considered properly tagged for this check.
     tagged_obj_nums: set[int] = set()
-    if struct_root is not None:
-        def _collect(node: Dictionary) -> None:
-            for kid in get_kids(node):
-                if isinstance(kid, Dictionary) and kid.get(Name.Type) == Name.OBJR:
-                    ref = kid.get(Name.Obj)
-                    if ref is not None:
-                        og = getattr(ref, "objgen", (0, 0))
-                        if og != (0, 0):
-                            tagged_obj_nums.add(og[0])
-        walk_struct_tree(struct_root, _collect)
+
+    def _collect(node: Dictionary) -> None:
+        if resolve_role(role_of(node) or "", struct_root) != "Form":
+            return
+        for kid in get_kids(node):
+            if isinstance(kid, Dictionary) and kid.get(Name.Type) == Name.OBJR:
+                ref = kid.get(Name.Obj)
+                if ref is not None:
+                    og = getattr(ref, "objgen", (0, 0))
+                    if og != (0, 0):
+                        tagged_obj_nums.add(og[0])
+
+    walk_struct_tree(struct_root, _collect)
 
     untagged: list[str] = []
     for page_idx, page in enumerate(pdf.pages):
@@ -1211,7 +1211,7 @@ def check_17_002(pdf: pikepdf.Pdf) -> CheckResult:
     missing: list[str] = []
     seen: set = set()
 
-    def _walk_fields(arr) -> None:
+    def _walk_fields(arr, inherited_ft=None) -> None:
         for item in arr:
             if not isinstance(item, Dictionary):
                 continue
@@ -1219,16 +1219,20 @@ def check_17_002(pdf: pikepdf.Pdf) -> CheckResult:
             if key in seen:
                 continue
             seen.add(key)
-            # Only terminal fields (with /FT) are interactive; non-terminal
-            # are pure containers.
-            if Name.FT in item:
+            # Effective /FT: own value, or inherited from parent chain.
+            effective_ft = item.get(Name.FT) or inherited_ft
+            kids = item.get(Name.Kids)
+            has_widget_kids = isinstance(kids, Array)
+            # A terminal field has no widget children (or has /FT and no kids
+            # that themselves carry /FT — widget annotations are the leaf nodes).
+            is_terminal = effective_ft is not None and not has_widget_kids
+            if is_terminal:
                 tu = item.get(Name.TU)
                 if tu is None or str(tu).strip() == "":
                     name = str(item.get(Name.T) or f"obj {getattr(item, 'objgen', (0,0))[0]}")
                     missing.append(name)
-            kids = item.get(Name.Kids)
-            if isinstance(kids, Array):
-                _walk_fields(kids)
+            if has_widget_kids:
+                _walk_fields(kids, inherited_ft=effective_ft)
 
     _walk_fields(fields_arr)
 
