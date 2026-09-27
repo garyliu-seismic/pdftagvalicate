@@ -17,18 +17,43 @@ from __future__ import annotations
 import pikepdf
 from pikepdf import Array, Dictionary, Name
 
-from .pdfutil import append_kid, ensure_tagged, get_kids, is_tagged, role_of
+from .pdfutil import append_kid, ensure_tagged, get_kids, is_tagged, role_of, visit_key
 from .types import RepairReport
+
+
+def collect_orphaned_links(pdf: pikepdf.Pdf) -> list[tuple[Dictionary, Dictionary]]:
+    """Read-only: returns (page_obj, annot) pairs for every Link annotation
+    not already referenced from a <Link> struct element."""
+    tagged_obj_nums: set[int] = set()
+    existing_root = pdf.Root.get(Name.StructTreeRoot)
+    if existing_root is not None:
+        _collect_tagged(existing_root, tagged_obj_nums, parent_is_link=False, visited=set())
+
+    orphans: list[tuple[Dictionary, Dictionary]] = []
+    for page in pdf.pages:
+        annots = page.get(Name.Annots)
+        if annots is None:
+            continue
+        page_obj = page.obj
+        for annot in annots:
+            if not isinstance(annot, Dictionary):
+                continue
+            if annot.get(Name.Subtype) != Name.Link:
+                continue
+            objgen = getattr(annot, "objgen", (0, 0))
+            if objgen == (0, 0) or objgen[0] in tagged_obj_nums:
+                continue
+            orphans.append((page_obj, annot))
+    return orphans
 
 
 def fix(pdf: pikepdf.Pdf) -> RepairReport:
     name = "Link annotation nesting"
 
-    # Step 1: collect annotation obj-numbers already referenced from <Link> elements.
-    tagged_obj_nums: set[int] = set()
-    existing_root = pdf.Root.get(Name.StructTreeRoot)
-    if existing_root is not None:
-        _collect_tagged(existing_root, tagged_obj_nums, parent_is_link=False)
+    # Step 1: find Link annotations not yet referenced from a <Link> element.
+    orphans = collect_orphaned_links(pdf)
+    if not orphans:
+        return RepairReport(name, 0, "All Link annotations are already properly nested.")
 
     # Step 2: ensure the document has a struct tree with a <Document> root element.
     if not is_tagged(pdf):
@@ -84,18 +109,18 @@ def fix(pdf: pikepdf.Pdf) -> RepairReport:
 
             obj_ref = Dictionary(Type=Name.OBJR, Pg=page_obj, Obj=annot)
 
-            link_dict = pdf.make_indirect(
-                Dictionary(Type=Name.StructElem, S=Name.Link, Pg=page_obj, P=doc_elem, K=obj_ref)
-            )
+        link_dict = pdf.make_indirect(
+            Dictionary(Type=Name.StructElem, S=Name.Link, Pg=page_obj, P=doc_elem, K=obj_ref)
+        )
 
-            append_kid(doc_elem, link_dict)
+        append_kid(doc_elem, link_dict)
 
-            annot[Name.StructParent] = next_key
-            nums.append(next_key)
-            nums.append(link_dict)
-            next_key += 1
+        annot[Name.StructParent] = next_key
+        nums.append(next_key)
+        nums.append(link_dict)
+        next_key += 1
 
-            fixed += 1
+        fixed += 1
 
     root[Name.ParentTreeNextKey] = next_key
 

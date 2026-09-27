@@ -27,17 +27,10 @@ from .types import RepairReport
 def fix(pdf: pikepdf.Pdf) -> RepairReport:
     name = "Fake TBody wrappers"
 
-    from .pdfutil import is_tagged
-
     if not is_tagged(pdf):
         return RepairReport(name, 0, "Document is not tagged - skipped.")
 
-    struct_root = pdf.Root.get(Name.StructTreeRoot)
-    if struct_root is None:
-        return RepairReport(name, 0, "No struct tree root - skipped.")
-
-    tables: list[Dictionary] = []
-    _collect_by_role(struct_root.get(Name.K), "Table", tables, set())
+    tables = collect_fake_tables(pdf)
 
     changes = 0
     for table in tables:
@@ -90,7 +83,7 @@ def _try_fix_fake_table(table: Dictionary, pdf: pikepdf.Pdf) -> bool:
     Returns True if the table was dissolved, False otherwise.
     """
     if _has_kid_role(table, "THead") or _has_kid_role(table, "TFoot"):
-        return False
+        return None
 
     # Find a single TBody, optionally behind wrapper elements.
     dict_kids = _get_all_dict_kids(table)

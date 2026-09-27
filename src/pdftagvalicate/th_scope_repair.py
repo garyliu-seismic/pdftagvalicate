@@ -19,16 +19,23 @@ _WRAPPER_ROLES: frozenset[str] = frozenset({
 from .types import RepairReport
 
 
+def collect_missing_scopes(pdf: pikepdf.Pdf) -> list[tuple[Dictionary, str]]:
+    """Read-only: returns (TH element, inferred scope) for each <TH> cell
+    missing a /Scope attribute. Does not modify the PDF."""
+    struct_root = pdf.Root.get(Name.StructTreeRoot)
+    findings: list[tuple[Dictionary, str]] = []
+    if struct_root is not None:
+        _collect_missing_scopes(struct_root, findings, set())
+    return findings
+
+
 def fix(pdf: pikepdf.Pdf) -> RepairReport:
     name = "TH /Scope attribute"
 
     if not is_tagged(pdf):
         return RepairReport(name, 0, "Document is not tagged - skipped.")
 
-    struct_root = pdf.Root.get(Name.StructTreeRoot)
-    findings: list[tuple[Dictionary, str]] = []
-    if struct_root is not None:
-        _collect_missing_scopes(struct_root, findings)
+    findings = collect_missing_scopes(pdf)
 
     if not findings:
         return RepairReport(name, 0, "All <TH> cells already have /Scope.")

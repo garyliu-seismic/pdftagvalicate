@@ -15,6 +15,10 @@ from typing import Iterable, Iterator, Optional
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Object
 
+# Common XMP namespaces (element local names are matched against these).
+DC_NS = "http://purl.org/dc/elements/1.1/"
+PDFUAID_NS = "http://www.aiim.org/pdfua/ns/id/"
+
 
 def is_tagged(pdf: pikepdf.Pdf) -> bool:
     """Mirrors iText's PdfDocument.IsTagged(): a StructTreeRoot exists and
@@ -44,6 +48,51 @@ def ensure_tagged(pdf: pikepdf.Pdf) -> None:
         root[Name.StructTreeRoot] = struct_root
 
 
+def get_xmp_property(
+    pdf: pikepdf.Pdf, local_name: str, namespace: Optional[str] = None
+) -> Optional[str]:
+    """Read an XMP property without mutating the PDF.
+
+    pikepdf's ``open_metadata()`` mutates the document even in read-only mode
+    (it creates a /Metadata stream and syncs/clears the legacy /Info
+    dictionary), so report-only checks must not use it. Instead we read the
+    raw /Metadata stream bytes and parse them here.
+
+    Returns the property's text, or the first ``rdf:li`` text for
+    Bag/Alt/Seq properties (e.g. dc:title, dc:language).
+    """
+    md = pdf.Root.get(Name.Metadata)
+    if md is None:
+        return None
+    try:
+        raw = md.read_raw_bytes()
+        root = ET.fromstring(raw.decode("utf-8", errors="replace"))
+    except (ET.ParseError, AttributeError, RuntimeError, ValueError):
+        return None
+
+    for el in root.iter():
+        if not isinstance(el.tag, str):
+            continue
+        if "}" in el.tag:
+            ns, name = el.tag[1:].split("}", 1)
+        else:
+            ns, name = "", el.tag
+        if name != local_name:
+            continue
+        if namespace is not None and ns != namespace:
+            continue
+
+        if el.text and el.text.strip():
+            return el.text.strip()
+        for li in el.iter():
+            if not isinstance(li.tag, str):
+                continue
+            if li.tag.rsplit("}", 1)[-1] == "li" and li.text and li.text.strip():
+                return li.text.strip()
+        return None
+    return None
+
+
 def get_kids(elem: Dictionary) -> list:
     """Returns the raw contents of /K as a Python list, regardless of whether
     /K is a single value or an array. Kids may be struct-element
@@ -66,6 +115,17 @@ def role_of(elem) -> Optional[str]:
         return None
     name = elem.get(Name.S)
     return str(name)[1:] if name is not None else None  # strip leading '/'
+
+
+def visit_key(obj) -> tuple | int:
+    """Stable identity key for cycle detection when walking a struct tree.
+
+    Uses the (obj, gen) pair for indirect objects and ``id()`` for direct
+    objects, so a malformed /K that points back at an ancestor can be
+    detected instead of recursing forever.
+    """
+    objgen = getattr(obj, "objgen", (0, 0))
+    return objgen if objgen != (0, 0) else id(obj)
 
 
 def same_object(a: Object, b: Object) -> bool:
